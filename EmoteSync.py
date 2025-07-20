@@ -6,10 +6,8 @@ from tkinter import filedialog, messagebox
 import random  # Import random module for displaying support message
 
 from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip, AudioFileClip, ColorClip
-from pydub import AudioSegment
 import whisper
 from transformers import pipeline
-import soundfile as sf  # Ensure soundfile is imported
 import numpy as np  # Import numpy for mathematical functions
 
 # Set up logging for debugging
@@ -55,7 +53,7 @@ def update_status(message):
 
 # Function to load emotion images
 def load_emotion_images(folder_path):
-    emotions = ['happy', 'neutral', 'annoyance', 'anger', 'confusion', 'disbelief']
+    emotions = ['happy', 'neutral', 'annoyance', 'anger', 'confusion', 'disbelief', 'filler', 'morefiller']
     emotion_images = {}
     for emotion in emotions:
         img_path = os.path.join(folder_path, f"{emotion}.png")
@@ -80,7 +78,7 @@ def transcribe_audio(audio_file, model):
             "and that the audio file is in a supported format."
         )
         raise e
-    return result['text']
+    return result  # Return the full result including segments
 
 # Function to detect emotions in text
 def detect_emotions_in_text(text, emotion_classifier, emotion_mapping):
@@ -97,32 +95,19 @@ def detect_emotions_in_text(text, emotion_classifier, emotion_mapping):
     emotion = emotion_mapping.get(model_emotion, 'neutral').lower()
     return emotion
 
-# Function to split audio into chunks
-def split_audio(audio_file, chunk_length_ms=5000):
-    try:
-        audio = AudioSegment.from_file(audio_file)
-    except Exception as e:
-        logger.error(f"Could not read audio file '{audio_file}'. Error: {e}")
-        raise e
-    chunks = []
-    for i in range(0, len(audio), chunk_length_ms):
-        chunk = audio[i:i + chunk_length_ms]
-        chunk_file = f"chunk_{i // chunk_length_ms}.wav"
-        chunk.export(chunk_file, format="wav")
-        start_time = i / 1000.0
-        end_time = min((i + chunk_length_ms) / 1000.0, audio.duration_seconds)
-        chunks.append((chunk_file, start_time, end_time))
-    return chunks
-
-# Function to process audio chunks and build the emotion timeline
-def process_audio_chunks(audio_file, emotion_classifier, emotion_mapping, model):
-    chunks = split_audio(audio_file)
+# Function to process audio segments and build the emotion timeline
+def process_audio_segments(audio_file, emotion_classifier, emotion_mapping, model):
+    update_status("Transcribing audio and getting segments...")
+    # Transcribe audio and get segments
+    result = transcribe_audio(audio_file, model)
+    segments = result['segments']
     emotion_timeline = []
-    chunk_count = len(chunks)
-    for idx, (chunk_file, start_time, end_time) in enumerate(chunks):
-        update_status(f"Processing chunk {idx+1}/{chunk_count}...")
-        # Transcribe the audio chunk
-        text = transcribe_audio(chunk_file, model)
+    segment_count = len(segments)
+    for idx, segment in enumerate(segments):
+        update_status(f"Processing segment {idx+1}/{segment_count}...")
+        text = segment['text']
+        start_time = segment['start']
+        end_time = segment['end']
         if not text.strip():
             emotion = 'neutral'
         else:
@@ -134,27 +119,68 @@ def process_audio_chunks(audio_file, emotion_classifier, emotion_mapping, model)
             'end': end_time,
             'emotion': emotion
         })
-        # Clean up the temporary chunk file
-        os.remove(chunk_file)
     return emotion_timeline
 
-# Function to detect emotions in the audio file
-def detect_emotions(audio_file, emotion_classifier, emotion_mapping, model):
-    return process_audio_chunks(audio_file, emotion_classifier, emotion_mapping, model)
+# Updated function to adjust emotion timeline based on min/max durations and cycle through fillers
+def adjust_emotion_timeline(emotion_timeline, total_duration, min_duration=10, max_duration=25, filler_emotions=['filler', 'morefiller']):
+    adjusted_timeline = []
+    prev_emotion = None
+    current_time = 0
+    filler_index = 0
+    idx = 0
+    while current_time < total_duration and idx < len(emotion_timeline):
+        segment = emotion_timeline[idx]
+        emotion = segment['emotion']
+        start = max(segment['start'], current_time)
+        end = segment['end']
+        duration = end - start
 
-# Function to merge consecutive segments with the same emotion
-def merge_consecutive_segments(emotion_timeline):
-    if not emotion_timeline:
-        return emotion_timeline
-    merged_timeline = [emotion_timeline[0]]
-    for segment in emotion_timeline[1:]:
-        last_segment = merged_timeline[-1]
-        if segment['emotion'] == last_segment['emotion']:
-            # Merge the segments by extending the end time
-            last_segment['end'] = segment['end']
-        else:
-            merged_timeline.append(segment)
-    return merged_timeline
+        # Adjust start and end to be within total_duration
+        start = min(start, total_duration)
+        end = min(end, total_duration)
+
+        # Recalculate duration
+        duration = end - start
+        if duration <= 0:
+            idx += 1
+            continue  # Skip segments that have no duration
+
+        # Enforce min_duration
+        if duration < min_duration:
+            duration = min_duration
+            end = start + duration
+            end = min(end, total_duration)
+            duration = end - start
+
+        # Avoid repeating frames
+        if emotion == prev_emotion:
+            # Insert filler segment
+            filler_emotion = filler_emotions[filler_index % len(filler_emotions)]
+            filler_index += 1
+            filler_start = current_time
+            filler_end = filler_start + min_duration
+            filler_end = min(filler_end, total_duration)
+            adjusted_timeline.append({'start': filler_start, 'end': filler_end, 'emotion': filler_emotion})
+            current_time = filler_end
+            # Do not increment idx to process the same segment again after the filler
+            continue
+
+        # Add the segment
+        segment_start = current_time
+        segment_end = segment_start + duration
+        segment_end = min(segment_end, total_duration)
+        adjusted_timeline.append({'start': segment_start, 'end': segment_end, 'emotion': emotion})
+        prev_emotion = emotion
+        current_time = segment_end
+        idx += 1
+
+    # Remove any segments where start >= end
+    adjusted_timeline = [seg for seg in adjusted_timeline if seg['end'] > seg['start']]
+    # Ensure we do not go beyond total_duration
+    for seg in adjusted_timeline:
+        if seg['end'] > total_duration:
+            seg['end'] = total_duration
+    return adjusted_timeline
 
 # The main processing function
 def process_video(audio_file, background_video_file, emotion_folder, use_background):
@@ -180,6 +206,7 @@ def process_video(audio_file, background_video_file, emotion_folder, use_backgro
             'fear': 'confusion',
             'surprise': 'disbelief',
             'disgust': 'annoyance',
+            'excited': 'excited',
         }
         
         # Initialize the emotion classifier
@@ -207,13 +234,46 @@ def process_video(audio_file, background_video_file, emotion_folder, use_backgro
         # Use audio duration as total duration
         total_duration = audio_clip.duration
 
+        # -------- NEW: pre‑compute a volume envelope for bounce modulation --------
+        sample_rate = 100          # desired envelope samples / sec
+
+         # 1) grab raw samples at the clip’s original sample‑rate
+        native_sr = audio_clip.fps            # e.g. 44100 Hz
+
+               
+        # moviepy ≥ 2.0 + NumPy ≥ 1.26: grab 1‑second chunks, then stack
+        chunks = [c for c in audio_clip.iter_chunks(fps=native_sr, chunk_duration=1.0)
+                  if c is not None and c.size]
+        pcm    = np.vstack(chunks)            # shape (n_samples, n_channels)
+
+
+
+        # 2) convert stereo → mono
+        mono = pcm.mean(axis=1)
+
+        # 3) down‑sample to ~`sample_rate` points via RMS in non‑overlapping windows
+        hop = max(1, int(native_sr / sample_rate))     # samples per envelope step
+        trimmed = mono[: (len(mono) // hop) * hop]     # drop tail to fit reshape
+        frames  = trimmed.reshape(-1, hop)             # shape (n_frames, hop)
+        rms     = np.sqrt((frames ** 2).mean(axis=1))  # RMS per frame
+
+        # 4) normalise 0‑1
+        volume_envelope = rms / (rms.max() + 1e-6)
+        # -------------------------------------------------------------------------
+
+
         # Process emotion timeline
         update_status("Detecting emotions in audio...")
-        emotion_timeline = detect_emotions(audio_file, emotion_classifier, emotion_mapping, model)
+        emotion_timeline = process_audio_segments(audio_file, emotion_classifier, emotion_mapping, model)
 
-        # Merge consecutive segments if "Avoid Repeating Images" is enabled
-        if avoid_repeating_var.get():
-            emotion_timeline = merge_consecutive_segments(emotion_timeline)
+        # Adjust emotion timeline based on min/max durations and cycle through fillers
+        emotion_timeline = adjust_emotion_timeline(
+            emotion_timeline,
+            total_duration,
+            min_duration=15,  # Minimum time in seconds
+            max_duration=30,  # Maximum time in seconds
+            filler_emotions=['filler', 'morefiller', 'evenmorefiller']  # Use your custom filler images
+        )
 
         # Set default fps
         fps = 24  # You can adjust this value as needed
@@ -257,15 +317,23 @@ def process_video(audio_file, background_video_file, emotion_folder, use_backgro
             background_video = ColorClip(size=(width, height), color=(0, 0, 0, 0)).set_duration(total_duration)
             background_video.fps = fps  # Set fps attribute for the background video
 
-        # Create bounce effect function (if bounce is enabled)
-        def bounce_effect(t):
-            # Bounce effect duration
-            d = 0.5  # 0.5 seconds
-            if t < d:
-                # Bounce scaling factor
-                return 1 + 0.05 * np.sin(2 * np.pi * 2 * t / d) * np.exp(-4 * t / d)
-            else:
-                return 1
+        # Gentle vertical bounce (not zoom) driven by loudness
+        def bounce_offset(t):
+            """
+            Returns a vertical pixel offset:
+              • quiet  → a few px
+              • loud   → up to ~10 % of the frame height
+              • motion = smooth sine wobble (0.25 s period)
+            Negative -> move up; positive -> move down.
+            """
+            idx = int(min(len(volume_envelope) - 1, t * sample_rate))
+            vol = volume_envelope[idx]
+
+            cycle = 0.5 - 0.2 * vol              # seconds per wobble
+            amp   = 0.02 + 0.08 * vol             # 2 % → 10 % of bg height
+            return -amp * background_video.h * np.sin(2 * np.pi * (t % cycle) / cycle)
+
+
 
         # Create image clips based on emotion timeline
         update_status("Creating emotion overlays...")
@@ -276,7 +344,7 @@ def process_video(audio_file, background_video_file, emotion_folder, use_backgro
             if not os.path.isfile(img_path):
                 logger.warning(f"No image found for emotion '{emotion}'. Using neutral image.")
                 img_path = emotion_images['neutral']
-        
+            
             logger.debug(
                 f"Creating clip for emotion '{emotion}' from {segment['start']} to {segment['end']}, "
                 f"using image '{img_path}'"
@@ -293,15 +361,19 @@ def process_video(audio_file, background_video_file, emotion_folder, use_backgro
             # Resize image to match background dimensions
             img_clip = img_clip.resize(height=background_video.h)
 
-            # Apply bounce effect if enabled
+            # Apply gentle up‑down bounce if enabled
             if bounce_var.get():
-                img_clip = img_clip.resize(lambda t: bounce_effect(t))
+                base_y = (background_video.h - img_clip.h) / 2    # vertical centre
+                img_clip = img_clip.set_position(
+                    lambda t, b=base_y: ('center', b + bounce_offset(t))
+                )
+
 
             # Set fps for image clip if necessary
             img_clip.fps = fps
 
             clips.append(img_clip)
-        
+
         # Compose final video
         update_status("Composing final video...")
         final_video = CompositeVideoClip([background_video] + clips)
@@ -320,7 +392,7 @@ def process_video(audio_file, background_video_file, emotion_folder, use_backgro
             codec = 'libvpx-vp9'  # VP9 codec supports alpha channel
             output_kwargs = {
                 'codec': codec,
-                'audio_codec': 'libvorbis',  # Changed from 'aac' to 'libvorbis'
+                'audio_codec': 'libvorbis',
                 'preset': 'ultrafast',
                 'ffmpeg_params': ['-pix_fmt', 'yuva420p']
             }
