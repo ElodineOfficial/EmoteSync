@@ -9,7 +9,9 @@ from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip, AudioFi
 import whisper
 from transformers import pipeline
 import numpy as np  # Import numpy for mathematical functions
+import bisect                               # quick word‑time lookup
 
+word_times = []
 # Set up logging for debugging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -71,7 +73,7 @@ def load_emotion_images(folder_path):
 # Function to transcribe audio using Whisper
 def transcribe_audio(audio_file, model):
     try:
-        result = model.transcribe(audio_file)
+        result = model.transcribe(audio_file, word_timestamps=True)
     except Exception as e:
         logger.error(
             "An error occurred during transcription. Please ensure that 'soundfile' is installed "
@@ -96,30 +98,61 @@ def detect_emotions_in_text(text, emotion_classifier, emotion_mapping):
     return emotion
 
 # Function to process audio segments and build the emotion timeline
+# Function to process audio segments and build the emotion timeline
 def process_audio_segments(audio_file, emotion_classifier, emotion_mapping, model):
+    global word_times                          # we’ll fill this list in
     update_status("Transcribing audio and getting segments...")
+
     # Transcribe audio and get segments
-    result = transcribe_audio(audio_file, model)
+    result   = transcribe_audio(audio_file, model)
     segments = result['segments']
+
+    # ------------------------------------------------------------------
+    word_step = 2          # 1 = every word, 2 = every other, etc.
+    word_times.clear()     # reuse the global list
+
+    for seg in segments:
+        if 'words' in seg and seg['words']:
+            word_times.extend(
+                [w['start'] for w in seg['words']][::word_step]
+            )
+        else:
+            words = seg['text'].strip().split()
+            if not words:
+                continue
+            hop = (seg['end'] - seg['start']) / len(words)
+            word_times.extend(
+                seg['start'] + i * hop for i in range(0, len(words), word_step)
+            )
+
+    word_times.sort()
+    # ------------------------------------------------------------------
+
+    # Build the emotion timeline (unchanged)
     emotion_timeline = []
-    segment_count = len(segments)
+    segment_count    = len(segments)
+
     for idx, segment in enumerate(segments):
         update_status(f"Processing segment {idx+1}/{segment_count}...")
-        text = segment['text']
+        text       = segment['text']
         start_time = segment['start']
-        end_time = segment['end']
+        end_time   = segment['end']
+
         if not text.strip():
             emotion = 'neutral'
         else:
-            # Detect the dominant emotion in the transcribed text
             emotion = detect_emotions_in_text(text, emotion_classifier, emotion_mapping)
-        # Append the emotion data to the timeline
+
         emotion_timeline.append({
-            'start': start_time,
-            'end': end_time,
+            'start':   start_time,
+            'end':     end_time,
             'emotion': emotion
         })
+
     return emotion_timeline
+
+
+
 
 # Updated function to adjust emotion timeline based on min/max durations and cycle through fillers
 def adjust_emotion_timeline(emotion_timeline, total_duration, min_duration=10, max_duration=25, filler_emotions=['filler', 'morefiller']):
@@ -321,24 +354,28 @@ def process_video(audio_file, background_video_file, emotion_folder, use_backgro
             background_video = ColorClip(size=(width, height), color=(0, 0, 0, 0)).set_duration(total_duration)
             background_video.fps = fps  # Set fps attribute for the background video
 
-        # Volume decides *whether* we bounce; size is always the same
+        # Each new (Nth) word triggers a single, gentle bounce
         def bounce_offset(t):
             """
-            • When volume rises above a soft threshold → start a bounce.
-            • Amplitude is fixed (~5 % of height) so every hop feels consistent.
+            Looks up the most recent word_start ≤ t.
+            Returns 0 outside the cycle window; inside, returns a half‑sine
+            offset so the avatar lifts then settles back to baseline.
             """
-            vol = np.interp(t,
-                            np.arange(len(volume_envelope)) / sample_rate,
-                            volume_envelope)
+            if not word_times:
+                return 0
 
-            # Smooth on/off: 0 when quiet, 1 when loud
-            thresh   = 0.1                     # tweak if needed
-            softness = 0.04                      # larger = gentler slope
-            gate     = 1 / (1 + np.exp(-(vol - thresh) / softness))   # sigmoid
+            idx = bisect.bisect_right(word_times, t) - 1
+            if idx < 0:
+                return 0
 
-            cycle = 2                          # seconds per wobble (steady)
-            amp   = 0.02 * background_video.h    # fixed 5 % bounce
-            return -gate * amp * np.sin(2 * np.pi * (t % cycle) / cycle)
+            cycle = 0.3                       # seconds per bounce
+            elapsed = t - word_times[idx]
+            if elapsed > cycle:
+                return 0                      # we're between words
+
+            amp = 0.05 * background_video.h   # fixed 5 % amplitude
+            phase = elapsed / cycle           # 0 → 1
+            return -amp * np.sin(np.pi * phase)  # half‑sine up‑and‑down
 
 
 
