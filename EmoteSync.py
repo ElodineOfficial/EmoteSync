@@ -257,9 +257,13 @@ def process_video(audio_file, background_video_file, emotion_folder, use_backgro
         frames  = trimmed.reshape(-1, hop)             # shape (n_frames, hop)
         rms     = np.sqrt((frames ** 2).mean(axis=1))  # RMS per frame
 
-        # 4) normalise 0‑1
         volume_envelope = rms / (rms.max() + 1e-6)
-        # -------------------------------------------------------------------------
+
+        # --- NEW: 100 ms moving‑average smooth ---
+        win = int(sample_rate * 0.10) or 1          # 0.10 s window
+        kernel = np.ones(win) / win
+        volume_envelope = np.convolve(volume_envelope, kernel, mode='same')
+        # -----------------------------------------
 
 
         # Process emotion timeline
@@ -317,21 +321,24 @@ def process_video(audio_file, background_video_file, emotion_folder, use_backgro
             background_video = ColorClip(size=(width, height), color=(0, 0, 0, 0)).set_duration(total_duration)
             background_video.fps = fps  # Set fps attribute for the background video
 
-        # Gentle vertical bounce (not zoom) driven by loudness
+        # Volume decides *whether* we bounce; size is always the same
         def bounce_offset(t):
             """
-            Returns a vertical pixel offset:
-              • quiet  → a few px
-              • loud   → up to ~10 % of the frame height
-              • motion = smooth sine wobble (0.25 s period)
-            Negative -> move up; positive -> move down.
+            • When volume rises above a soft threshold → start a bounce.
+            • Amplitude is fixed (~5 % of height) so every hop feels consistent.
             """
-            idx = int(min(len(volume_envelope) - 1, t * sample_rate))
-            vol = volume_envelope[idx]
+            vol = np.interp(t,
+                            np.arange(len(volume_envelope)) / sample_rate,
+                            volume_envelope)
 
-            cycle = 0.5 - 0.2 * vol              # seconds per wobble
-            amp   = 0.02 + 0.08 * vol             # 2 % → 10 % of bg height
-            return -amp * background_video.h * np.sin(2 * np.pi * (t % cycle) / cycle)
+            # Smooth on/off: 0 when quiet, 1 when loud
+            thresh   = 0.1                     # tweak if needed
+            softness = 0.04                      # larger = gentler slope
+            gate     = 1 / (1 + np.exp(-(vol - thresh) / softness))   # sigmoid
+
+            cycle = 2                          # seconds per wobble (steady)
+            amp   = 0.02 * background_video.h    # fixed 5 % bounce
+            return -gate * amp * np.sin(2 * np.pi * (t % cycle) / cycle)
 
 
 
