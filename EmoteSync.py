@@ -1,13 +1,16 @@
-
 """
-EmoteSync (fixed v3) — GLOBAL anti-linger + neutral lock + strict RR + robust splitting
+EmoteSync (fixed v3.1) — "switch at START of next sentence" + GLOBAL anti-linger + neutral lock + strict RR + robust splitting
 
 What this version guarantees:
-  ✓ **Global anti-linger (emotion run limit):** The same *emotion* cannot occupy
-    the screen for more than `EMOTION_RUN_MAX_SECONDS` (default 15s). If the
-    analysis keeps predicting the same emotion, we insert a *bridge* emotion
-    chosen from the current sentence’s **top‑2 emotion predictions** (or a
-    sensible configured fallback) so the on-screen state *must* change.
+  ✓ **Switch at START of next sentence (no dead‑air flip):**
+    Frame changes are aligned to the *start time of the next sentence’s first word*,
+    so the previous frame persists through any silence between sentences.
+  ✓ **Global anti-linger (emotion run limit):**
+    The same *emotion* cannot occupy the screen for more than
+    `EMOTION_RUN_MAX_SECONDS` (default 15s). If the analysis keeps predicting the
+    same emotion, we insert a *bridge* emotion chosen from the current sentence’s
+    **top‑k** emotion predictions (or a sensible configured fallback) so the on-screen
+    state *must* change.
   ✓ **Neutral lock:** "neutral" may appear at most once in a row; repeated
     neutrals redirect to last/best non‑neutral base.
   ✓ **Strict 10–15s pacing:** we rotate at sentence boundaries with a 10–15s
@@ -78,7 +81,7 @@ IDLE_FALLBACK_PRIORITY = ["idle", "listen", "listening", "thinking", "curious", 
 # Logging
 # -----------------------------------------------------------------------------
 logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger("EmoteSyncFixedV3")
+logger = logging.getLogger("EmoteSyncFixedV3_1")
 
 def update_status(message: str):
     status_var.set(message)
@@ -284,8 +287,10 @@ def _split_text_sentences_with_durations(text, start, end, max_len=SENTENCE_MAX_
 
 def _segments_to_sentences(segments, pause_threshold=PAUSE_SPLIT_THRESHOLD, max_len=SENTENCE_MAX_SECONDS):
     """
-    Convert Whisper segments into sentence‑like chunks. Prefer word timestamps;
-    otherwise split by punctuation with proportional timing.
+    Convert Whisper segments into sentence‑like chunks.
+    **FIXED**: A long pause now creates a boundary *before* the next word, so that
+    the next sentence begins exactly at that word’s start time. This guarantees that
+    frame switches happen at the START of the next sentence (no flip during silence).
     """
     out = []
     for seg in segments:
@@ -303,30 +308,46 @@ def _segments_to_sentences(segments, pause_threshold=PAUSE_SPLIT_THRESHOLD, max_
 
         for w in words:
             w_text = str(w.get("word", ""))
-            if buf_start is None:
-                buf_start = float(w.get("start", seg_start))
-            buf.append(w)
-            w_start = float(w.get("start", buf_start))
+            w_start = float(w.get("start", seg_start))
             w_end = float(w.get("end", w_start))
-            boundary = False
 
-            if last_end is not None and (w_start - last_end) >= pause_threshold:
-                boundary = True
+            # --- boundary BEFORE this word, if a long pause occurred ---
+            # If there was a pause >= threshold since the previous word,
+            # we finish the previous sentence at the *previous* word's end (last_end)
+            # and start a new sentence that begins exactly at w_start.
+            pre_boundary = last_end is not None and (w_start - last_end) >= pause_threshold and buf
+            if pre_boundary:
+                text_prev = "".join(x.get("word", "") for x in buf).strip()
+                out.append({
+                    "start": buf_start if buf_start is not None else seg_start,
+                    "end": last_end,
+                    "text": text_prev
+                })
+                buf = []          # reset buffer; current word 'w' starts the next sentence
+                buf_start = None  # will set to w_start below
+
+            if buf_start is None:
+                buf_start = w_start
+            buf.append(w)
+
+            # --- boundary AFTER this word (punctuation or max length) ---
+            boundary_after = False
             if re.search(r'[.!?;:]\s*$', w_text):
-                boundary = True
+                boundary_after = True
             if (w_end - buf_start) >= max_len:
-                boundary = True
+                boundary_after = True
 
             last_end = w_end
 
-            if boundary:
+            if boundary_after:
                 text = "".join(x.get("word", "") for x in buf).strip()
                 out.append({"start": buf_start, "end": w_end, "text": text})
                 buf = []
                 buf_start = None
-                last_end = None
+                # keep last_end at w_end for potential next pre-boundary checks
 
         if buf:
+            # close any trailing buffer
             w_end = float(buf[-1].get("end", seg_end))
             text = "".join(x.get("word", "") for x in buf).strip()
             out.append({"start": buf_start if buf_start is not None else seg_start,
@@ -472,6 +493,10 @@ def build_display_timeline_by_sentences(
       - neutral lock (at most one neutral in a row)
       - global anti-linger (max contiguous same base time)
       - sentence-boundary driven swaps (plus defensive hard-cap post-splitting)
+
+    **Important**: Swaps are aligned to the *start of the next sentence* — we hold
+    the current frame through any inter-sentence silence and only flip when the
+    next sentence’s first word starts.
     """
     timeline = []
 
@@ -510,7 +535,7 @@ def build_display_timeline_by_sentences(
     run_base = display_base
     run_start_time = current_start
 
-    # Walk boundaries
+    # Walk boundaries (always aligned to the *next sentence start*)
     for idx in range(1, len(sentence_timeline)):
         boundary = float(sentence_timeline[idx]["start"])
         boundary = min(boundary, total_duration)
@@ -539,7 +564,7 @@ def build_display_timeline_by_sentences(
             should_rotate = True
 
         if should_rotate:
-            # Close current
+            # Close current (up to the *start* of the next sentence)
             if current_image:
                 timeline.append({
                     "start": current_start,
@@ -832,15 +857,16 @@ def show_about_us():
         "About This Tool",
         "EmoteSync analyzes audio, detects emotions per sentence, and shows matching images.\n\n"
         f"Swaps at sentence boundaries with a strict 10–15s target; hard cap {HARD_CAP_SECONDS:.0f}s.\n"
-        f"Global anti‑linger: the same emotion cannot persist beyond {EMOTION_RUN_MAX_SECONDS:.0f}s; we bridge to a top‑2 candidate.\n"
-        "Neutral lock: neutral may appear at most once in a row."
+        f"Global anti‑linger: the same emotion cannot persist beyond {EMOTION_RUN_MAX_SECONDS:.0f}s; we bridge to a top‑k candidate.\n"
+        "Neutral lock: neutral may appear at most once in a row.\n"
+        "Now aligned to the START of the next sentence (no dead‑air flip)."
     )
 
 # -----------------------------------------------------------------------------
 # Tk UI
 # -----------------------------------------------------------------------------
 root = tk.Tk()
-root.title("EmoteSync (fixed v3)")
+root.title("EmoteSync (fixed v3.1)")
 
 audio_file_var = tk.StringVar()
 background_file_var = tk.StringVar()
