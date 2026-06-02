@@ -1,0 +1,14 @@
+# EmoteSync dependencies
+# Versions chosen so the whole stack (whisper + numba + moviepy + torch) resolves
+# cleanly on Python 3.10 - 3.12 with prebuilt wheels (no compiler needed).
+
+numpy==1.26.4          # numba / moviepy 1.x / torch all happy here; cp310-312 wheels
+moviepy==1.0.3         # keeps the classic moviepy.editor API this app is built on
+imageio-ffmpeg         # also a moviepy dep; the launcher uses it to provide ffmpeg.exe
+
+openai-whisper         # pulls torch, numba, tiktoken, tqdm, more-itertools
+transformers>=4.40,<5  # emotion classifier pipeline
+torch                  # CPU build by default on Windows/macOS from PyPI
+
+# Pillow is pulled in by moviepy. Pillow 10 removed Image.ANTIALIAS, which moviepy
+# 1.x uses; emotesync.py re-adds it at startup, so any wheel-available Pillow works.
