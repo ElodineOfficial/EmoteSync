@@ -1,5 +1,7 @@
 # EmoteSync: A PNGTuber’s best friend!
 
+6/2/26: This README is outdated, emotesync has recently been overhauled to clear out many bugs and make the process smoother. 
+
 EmoteSync is a Python application that analyzes audio files, detects emotions using AI models, and generates videos with corresponding emotion images overlaid on a background video or transparent background. It leverages AI models like OpenAI's Whisper for speech recognition and Hugging Face's transformers for emotion detection.
 
 ## Table of Contents
